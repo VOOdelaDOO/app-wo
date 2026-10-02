@@ -1,0 +1,1 @@
+Lector de fotos (Tesseract.js 5.1.1, licencia Apache-2.0) empaquetado dentro de la app.
