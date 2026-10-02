@@ -219,12 +219,14 @@ pre.ocr{white-space:pre-wrap;font-size:12px;background:var(--bg);border-radius:1
  * Hoja de Google. Si no hay cobertura, las acciones esperan en cola.
  * ======================================================================== */
 
-var VERSION = '1.1.0';
+var VERSION = '1.2.0';
 // Servidor (Apps Script). Si la app se abre fuera de Google (GitHub Pages) habla con él por fetch.
 var API_URL = 'https://script.google.com/macros/s/AKfycbwgnPW14beEEiMFyUXsc-_E-fvKIoIYkGH67SHarAOm-2l8DGTWWUzGag6EuOP__9bK/exec';
 var LS_KEY = 'appwo.v1';
 var OCR_IDIOMAS = 'spa';
-var TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+var TESSERACT_CDN = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+/** Fuera de Google (GitHub Pages) el lector de fotos va EMPAQUETADO dentro de la app (carpeta ocr/). */
+function ocrLocal() { return !(window.google && google.script); }
 var SYNC_CADA_MS = 30000;
 
 var NOMBRE_ESTADO = { pendiente: 'Pendiente', en_curso: 'En curso', pausada: 'Pausada',
@@ -1365,14 +1367,21 @@ function ocrImagen(file) {
   return cargarImagen(file).then(function (img) {
     canvas = prepararParaOCR(img);
     cargando('Cargando el lector… (la primera vez tarda un poco)');
-    return cargarScript(TESSERACT_URL);
+    return cargarScript(ocrLocal() ? new URL('ocr/tesseract.min.js', location.href).href : TESSERACT_CDN);
   }).then(function () {
-    return Tesseract.createWorker(OCR_IDIOMAS, 1, {
+    var opciones = {
       logger: function (m) {
         if (m.status === 'recognizing text') cargando('Leyendo la orden… ' + Math.round(m.progress * 100) + '%');
         else if (/loading|initializ/.test(m.status)) cargando('Cargando el lector… ' + Math.round((m.progress || 0) * 100) + '%');
       }
-    });
+    };
+    if (ocrLocal()) {
+      var base = new URL('ocr/', location.href).href;
+      opciones.workerPath = base + 'worker.min.js';
+      opciones.corePath = base;
+      opciones.langPath = base;
+    }
+    return Tesseract.createWorker(OCR_IDIOMAS, 1, opciones);
   }).then(function (worker) {
     return worker.recognize(canvas).then(function (r) {
       worker.terminate();
