@@ -213,13 +213,247 @@ pre.ocr{white-space:pre-wrap;font-size:12px;background:var(--bg);border-radius:1
 <input type="file" id="in-galeria" accept="image/*" hidden>
 
 <script>
+/* ==========================================================================
+ * Lectura de la orden ICAFM ("Trabajar de orden") a partir del texto leído.
+ * Funciona con:
+ *   - palabras con posición (OCR de foto/captura): respeta columnas y tablas
+ *   - texto pegado (copiado de ICAFM)
+ * ======================================================================== */
+
+// Etiquetas del impreso de ICAFM (sin acentos y en minúsculas; "." = cualquier letra, por los
+// fallos típicos del OCR con las tildes). campo null = se reconoce pero no se guarda.
+var ICAFM_ETIQUETAS = [
+  ['descripcion', 'detalles? descripci.n( de la)? orden de trabajo|detalles? descripci.n|descripci.n orden de trabajo|descripci.n|description|detalles?'],
+  ['wo', 'trabajar de orden|orden de trabajo|work ?order( n.| number| id)?|n. ?(de )?(wo|orden)'],
+  ['titulo', 'breve descripci.n|descripci.n breve|short description|summary|resumen|t.tulo|asunto'],
+  ['tipoTrabajo', 'tipo de trabajo|work ?type|task ?type'],
+  ['estadoIcafm', 'estado|status'],
+  ['solicitante', 'solicitante|reported by|requested by|reportado por|requester'],
+  ['grupoTrabajo', 'grupo de trabajo|work ?group'],
+  ['responsable', 'responsable|responsible'],
+  ['grupoServicios', 'grupo de servicios|service ?group'],
+  ['servicio', 'servicio|service'],
+  ['equipo', 'activo|asset|equipo'],
+  ['ubicacion', 'ubicaci.n|localizaci.n|emplazamiento|zona'],
+  ['prioridad', 'prioridad|priority'],
+  ['fechaLimite', 'target finish|fecha l.mite|fecha objetivo|due date'],
+  ['inicioReal', 'inicio real|actual start'],
+  ['tiempoIcafm', 'tiempo dedicado|time spent'],
+  [null, 'proveedor|supplier|sub.?supplier|plan de trabajo|site|location|target start|tiempo asignado|' +
+    '.{0,3}el tiempo de inactividad|tiempo de inactividad|instrucciones de seguridad|descripci.n de los riesgos|' +
+    'precauci.n descripci.n|comentarios.{0,4}observaciones|comunicaci.n logs|trabajar logs|finalizaci.n real|' +
+    'id de tarea|unidad|valor|comentarios']
+];
+var ICAFM_SECCIONES = /^(allocation|detalles y programaci.n|reporting|tarea|geography|t.cnico|gente)\b/;
+
+var RE_ICAFM = ICAFM_ETIQUETAS.map(function (e) {
+  var sinGrupos = e[1].replace(/\((?!\?)/g, '(?:');
+  return { campo: e[0], re: new RegExp('^(?:' + sinGrupos + ')\\s*[:;.]?\\s*(.*)$') };
+});
+var RE_ETIQ_DENTRO = new RegExp('(?:^|\\s)(?:' + ICAFM_ETIQUETAS
+  .map(function (e) { return e[1].replace(/\((?!\?)/g, '(?:'); }).join('|') + ')\\s*:', 'i');
+
+function normEtiq(s) {
+  return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+    .replace(/[|\[\]{}]/g, ' ').replace(/^[^a-z0-9?]+/, '').replace(/\s+/g, ' ').trim();
+}
+
+/** ¿Es una etiqueta? Devuelve {campo, resto} o null. */
+function etiquetaICAFM(texto) {
+  var n = normEtiq(texto);
+  if (!n) return null;
+  if (ICAFM_SECCIONES.test(n) && n.length < 30) return { campo: null, resto: '', seccion: true };
+  for (var i = 0; i < RE_ICAFM.length; i++) {
+    var m = n.match(RE_ICAFM[i].re);
+    if (!m) continue;
+    // Exigir dos puntos o que la etiqueta sea casi todo el texto (evita confundir valores con etiquetas)
+    var etiq = n.slice(0, n.length - m[1].length);
+    var conDosPuntos = /[:;]/.test(etiq);
+    // Las etiquetas de varias palabras ("Breve Descripcion", "Grupo de servicios"…) valen aunque el OCR pierda los dos puntos
+    var compuesta = /\s/.test(etiq.replace(/[:;.\s]+$/, ''));
+    if (!conDosPuntos && !compuesta && m[1].length > 0) continue;
+    // Recuperar el resto con mayúsculas/acentos originales
+    var original = String(texto).replace(/^[^A-Za-zÀ-ÿ0-9?]+/, '');
+    var resto = m[1] ? original.slice(original.length - m[1].length) : '';
+    return { campo: RE_ICAFM[i].campo, resto: resto.trim() };
+  }
+  return null;
+}
+
+var MESES = { ene: 1, feb: 2, mar: 3, abr: 4, may: 5, jun: 6, jul: 7, ago: 8, sep: 9, set: 9, oct: 10, nov: 11, dic: 12,
+  jan: 1, apr: 4, aug: 8, dec: 12 };
+function fechaTexto(v) {
+  var s = normEtiq(v);
+  var m = s.match(/\b(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})\b/);
+  if (m) return pad2(m[1]) + '/' + pad2(m[2]) + '/' + (m[3].length === 2 ? '20' + m[3] : m[3]);
+  m = s.match(/\b(\d{1,2})\s+([a-z]{3,})\.?\s+(\d{4})\b/);
+  if (m && MESES[m[2].slice(0, 3)]) return pad2(m[1]) + '/' + pad2(MESES[m[2].slice(0, 3)]) + '/' + m[3];
+  return '';
+}
+function pad2(n) { n = String(+n); return n.length < 2 ? '0' + n : n; }
+
+function limpiarCampo(campo, v) {
+  v = String(v || '').replace(/\s+/g, ' ').replace(/^[:;.\-–#\s|_~]+/, '').replace(/[\s|]+[|lI]?$/, '').trim();
+  var otra = normEtiq(' ' + v).length ? (' ' + v).normalize('NFD').replace(/[\u0300-\u036f]/g, '').match(RE_ETIQ_DENTRO) : null;
+  if (otra) v = v.slice(0, Math.max(0, otra.index)).trim(); // "Anna Utterstrom Grupo de servicios: Food…" -> "Anna Utterstrom
+  if (/^(null[\s\-]*)+$/i.test(v)) return '';
+  if (campo === 'wo') {
+    var w = v.replace(/[oO]/g, '0').match(/\d{5,}/);
+    return w ? w[0] : '';
+  }
+  if (campo === 'fechaLimite' || campo === 'inicioReal') return fechaTexto(v);
+  if (campo === 'tiempoIcafm') { var t = v.replace(',', '.').match(/\d+(\.\d+)?/); return t ? t[0] : ''; }
+  if (campo === 'tipoTrabajo' || campo === 'estadoIcafm') return v.split(' ')[0].toUpperCase().replace(/[^A-Z_\-]/g, '');
+  v = v.replace(/(^|\s)[|]+(?=\s|$)/g, ' ').replace(/\bE!(?=\s)/g, 'El').replace(/\s+/g, ' ').trim();
+  return v.slice(0, campo === 'descripcion' ? 2000 : 200);
+}
+
+/* ---- Renglones y celdas ---------------------------------------------------- */
+
+/** Palabras OCR [{t,x0,y0,x1,y1}] -> renglones [{y, h, celdas:[{t,x0,x1}]}] respetando columnas. */
+function renglonesDePalabras(palabras) {
+  var ws = palabras.filter(function (w) { return w.t && w.t.trim() && !/^[|_~—=]+$/.test(w.t.trim()); }).map(function (w) {
+    return { t: w.t.trim(), x0: w.x0, x1: w.x1, y0: w.y0, y1: w.y1, cy: (w.y0 + w.y1) / 2, h: w.y1 - w.y0 };
+  });
+  if (!ws.length) return [];
+  var hs = ws.filter(function (w) { return /[A-Za-z0-9]{2,}/.test(w.t); }).map(function (w) { return w.h; })
+    .sort(function (a, b) { return a - b; });
+  var hMed = hs[Math.floor(hs.length / 2)] || 20;
+  ws.sort(function (a, b) { return a.cy - b.cy; });
+  var rs = [];
+  ws.forEach(function (w) {
+    var r = null;
+    for (var i = rs.length - 1; i >= 0 && i >= rs.length - 4; i--) {
+      if (Math.abs(rs[i].y - w.cy) < hMed * 0.55) { r = rs[i]; break; }
+    }
+    if (!r) { r = { y: w.cy, ws: [] }; rs.push(r); }
+    r.ws.push(w);
+    r.y = r.ws.reduce(function (s, x) { return s + x.cy; }, 0) / r.ws.length;
+  });
+  rs.sort(function (a, b) { return a.y - b.y; });
+  return rs.map(function (r) {
+    r.ws.sort(function (a, b) { return a.x0 - b.x0; });
+    var celdas = [], cur = null;
+    r.ws.forEach(function (w) {
+      // hueco grande = otra celda (otra columna); los dos puntos de una etiqueta también cierran celda
+      var hueco = cur ? w.x0 - cur.x1 : 0;
+      if (!cur || hueco > hMed * 1.4 || (/:$/.test(cur.t) && hueco > hMed * 0.9)) {
+        cur = { t: w.t, x0: w.x0, x1: w.x1 }; celdas.push(cur);
+      } else { cur.t += ' ' + w.t; cur.x1 = w.x1; }
+    });
+    return { y: r.y, h: hMed, celdas: celdas };
+  });
+}
+
+/** Texto pegado -> renglones (celdas separadas por tabuladores o 2+ espacios). */
+function renglonesDeTexto(texto) {
+  return String(texto || '').split(/\r?\n/).map(function (linea, i) {
+    var celdas = [], re = /[^\t]+?(?=\t| {2,}|$)/g, m;
+    while ((m = re.exec(linea))) {
+      var t = m[0].trim();
+      if (t) celdas.push({ t: t, x0: m.index, x1: m.index + m[0].length });
+      if (re.lastIndex === m.index) re.lastIndex++;
+    }
+    return { y: i * 10, h: 10, celdas: celdas, texto: true };
+  }).filter(function (r) { return r.celdas.length; });
+}
+
+/* ---- Extracción --------------------------------------------------------------- */
+
+function extraerCamposICAFM(renglones) {
+  var campos = {};
+  var marcas = renglones.map(function (r) { return r.celdas.map(function (c) { return etiquetaICAFM(c.t); }); });
+  for (var i = 0; i < renglones.length; i++) {
+    var r = renglones[i];
+    for (var j = 0; j < r.celdas.length; j++) {
+      var et = marcas[i][j];
+      if (!et || !et.campo || campos[et.campo]) continue;
+      var c = r.celdas[j], valor = et.resto;
+      if (et.campo === 'descripcion') {
+        var lineas = valor ? [valor] : [];
+        var ultimoY = r.y;
+        for (var k = i + 1; k < renglones.length && lineas.length < 10; k++) {
+          var rk = renglones[k];
+          if (rk.y - ultimoY > rk.h * 6.5) break;
+          // celda alineada con la etiqueta (misma columna)
+          var tope = r.texto ? 3 : rk.h * 3;
+          var cel = null, idx = -1;
+          for (var q = 0; q < rk.celdas.length; q++) {
+            if (Math.abs(rk.celdas[q].x0 - c.x0) <= tope) { cel = rk.celdas[q]; idx = q; break; }
+          }
+          if (!cel) {
+            if (r.texto) break;
+            continue;
+          }
+          if (marcas[k][idx]) { if (r.texto && !marcas[k][idx].campo && !marcas[k][idx].seccion) continue; break; }
+          lineas.push(cel.t);
+          ultimoY = rk.y;
+        }
+        valor = lineas.join(' ');
+      } else if (!valor) {
+        // Valor: la celda de la derecha más cercana en el mismo renglón (o casi, por la inclinación de la foto)
+        var mejor = null, dist = Infinity;
+        for (var k2 = Math.max(0, i - 1); k2 <= Math.min(renglones.length - 1, i + 1); k2++) {
+          var rr = renglones[k2];
+          if (Math.abs(rr.y - r.y) > r.h * (r.texto ? 0.1 : 0.9)) continue;
+          for (var q2 = 0; q2 < rr.celdas.length; q2++) {
+            var cc = rr.celdas[q2];
+            if (cc.x0 < c.x1 - 2 || marcas[k2][q2]) continue;
+            var d = cc.x0 - c.x1 + Math.abs(rr.y - r.y) * 3;
+            if (d < dist) { dist = d; mejor = cc; }
+          }
+        }
+        // Solo si no hay otra etiqueta entre medias
+        if (mejor) {
+          var hayEtiqueta = r.celdas.some(function (x, q3) { return marcas[i][q3] && x.x0 > c.x1 && x.x0 < mejor.x0; });
+          if (!hayEtiqueta) valor = mejor.t;
+        }
+      }
+      var v = limpiarCampo(et.campo, valor);
+      if (v) campos[et.campo] = v;
+    }
+  }
+  return campos;
+}
+
+/** Recursos sobre el texto completo (por si el OCR no ha separado bien las etiquetas). */
+function completarPorTexto(campos, texto) {
+  texto = String(texto || '');
+  if (!campos.wo) {
+    var w = texto.match(/\bW[O0]\s*[-–]?\s*(\d{5,})/i) || texto.match(/\b(?:OT|orden)\s*[:#nº°.\-]*\s*(\d{5,})/i);
+    if (w) campos.wo = w[1];
+  }
+  if (!campos.solicitud) {
+    var s = texto.match(/\bSR\s*[-–]\s*(\d{4,})/i);
+    if (s) campos.solicitud = 'SR-' + s[1];
+  }
+  if (!campos.tipoTrabajo) {
+    var t = texto.match(/\b(CORRECTIVE|PREVENTIVE|CORRECTIVO|PREVENTIVO)\b/i);
+    if (t) campos.tipoTrabajo = t[1].toUpperCase();
+  }
+  if (!campos.titulo && campos.descripcion) campos.titulo = campos.descripcion.replace(/^buen[oa]s[,.\s]*/i, '').slice(0, 80);
+  return campos;
+}
+
+/** Entrada principal. palabras = OCR con posiciones (opcional); texto = texto plano. */
+function leerOrdenICAFM(texto, palabras) {
+  var campos = {};
+  if (palabras && palabras.length) campos = extraerCamposICAFM(renglonesDePalabras(palabras));
+  var deTexto = extraerCamposICAFM(renglonesDeTexto(texto));
+  Object.keys(deTexto).forEach(function (k) { if (!campos[k]) campos[k] = deTexto[k]; });
+  return completarPorTexto(campos, texto);
+}
+
+if (typeof module !== 'undefined') module.exports = { leerOrdenICAFM: leerOrdenICAFM, renglonesDePalabras: renglonesDePalabras,
+  extraerCamposICAFM: extraerCamposICAFM, etiquetaICAFM: etiquetaICAFM };
+
 'use strict';
 /* ==========================================================================
  * APP-WO · cliente (móvil). Se guarda todo en el móvil y se sincroniza con la
  * Hoja de Google. Si no hay cobertura, las acciones esperan en cola.
  * ======================================================================== */
 
-var VERSION = '1.2.0';
+var VERSION = '1.3.0';
 // Servidor (Apps Script). Si la app se abre fuera de Google (GitHub Pages) habla con él por fetch.
 var API_URL = 'https://script.google.com/macros/s/AKfycbwgnPW14beEEiMFyUXsc-_E-fvKIoIYkGH67SHarAOm-2l8DGTWWUzGag6EuOP__9bK/exec';
 var LS_KEY = 'appwo.v1';
@@ -232,7 +466,9 @@ var SYNC_CADA_MS = 30000;
 var NOMBRE_ESTADO = { pendiente: 'Pendiente', en_curso: 'En curso', pausada: 'Pausada',
   terminada: 'Terminada', cerrada: 'Cerrada', facturada: 'Facturada' };
 var EDITABLES = ['wo', 'titulo', 'descripcion', 'ubicacion', 'equipo', 'prioridad', 'fechaLimite',
-  'solicitante', 'trabajo', 'materiales', 'observaciones'];
+  'solicitante', 'trabajo', 'materiales', 'observaciones',
+  'tipoTrabajo', 'estadoIcafm', 'grupoTrabajo', 'responsable', 'grupoServicios', 'servicio', 'solicitud',
+  'inicioReal', 'tiempoIcafm'];
 
 var S = {
   user: '', pin: '', rol: '', operarios: [], supervisores: [], empresa: '', apiUrl: '',
@@ -704,7 +940,7 @@ function pintarListaDatos() {
   var lista = todas.filter(function (o) {
     if (est && est.indexOf(o.estado) < 0) return false;
     if (!q) return true;
-    var txt = quitarAcentos([o.wo, o.titulo, o.descripcion, o.ubicacion, o.equipo, o.trabajo, o.solicitante].join(' ').toLowerCase());
+    var txt = quitarAcentos([o.wo, o.titulo, o.descripcion, o.ubicacion, o.equipo, o.trabajo, o.solicitante, o.servicio, o.grupoServicios, o.solicitud, o.tipoTrabajo].join(' ').toLowerCase());
     return txt.indexOf(q) >= 0;
   }).sort(function (a, b) {
     var d = (ORDEN_ESTADO[a.estado] || 9) - (ORDEN_ESTADO[b.estado] || 9);
@@ -729,6 +965,7 @@ function pintarListaDatos() {
       '<span class="badge e-' + o.estado + '">' + (NOMBRE_ESTADO[o.estado] || o.estado) + '</span></div>' +
       '<div class="orden-tit">' + esc(o.titulo || o.descripcion || '—') + '</div>' +
       '<div class="meta">' +
+      (o.tipoTrabajo ? '<span>' + ico('bandera', 's') + esc(o.tipoTrabajo) + '</span>' : '') +
       (o.ubicacion ? '<span>' + ico('pin', 's') + esc(o.ubicacion) + '</span>' : '') +
       (o.prioridad ? '<span>' + ico('bandera', 's') + esc(o.prioridad) + '</span>' : '') +
       (o.fechaLimite ? '<span>' + ico('calendario', 's') + esc(o.fechaLimite) + '</span>' : '') +
@@ -776,7 +1013,7 @@ function pegarTexto() {
     var t = $('#p-txt').value;
     if (!t.trim()) return toast('No hay texto');
     cerrarModal();
-    borrador = { campos: parsearOrden(t), textoLeido: t };
+    borrador = { campos: leerOrdenICAFM(t, null), textoLeido: t };
     irA({ vista: 'nueva' });
   };
   setTimeout(function () { var t = $('#p-txt'); if (t) t.focus(); }, 50);
@@ -793,10 +1030,11 @@ function elegirImagen(inputId) {
 
 function leerOrdenDeImagen(file) {
   var fotoPrep = comprimirImagen(file, 1600, 0.8);
-  ocrImagen(file).then(function (texto) {
+  ocrImagen(file).then(function (res) {
+    var texto = res.texto;
     return fotoPrep.then(function (foto) {
       cargando(false);
-      var campos = parsearOrden(texto);
+      var campos = leerOrdenICAFM(texto, res.palabras);
       var n = Object.keys(campos).filter(function (k) { return campos[k]; }).length;
       borrador = { campos: campos, textoLeido: texto, foto: foto };
       toast(n ? 'Leídos ' + n + ' campos. Revísalos.' : 'No he reconocido campos: rellénalos tú (el texto leído está abajo).', n ? 'ok' : '', 4000);
@@ -812,13 +1050,22 @@ function leerOrdenDeImagen(file) {
 
 var CAMPOS_FORM = [
   ['wo', 'Nº WO', 'text', ''],
-  ['prioridad', 'Prioridad', 'text', ''],
-  ['titulo', 'Título / resumen', 'text', 'todo'],
-  ['descripcion', 'Descripción', 'area', 'todo'],
+  ['tipoTrabajo', 'Tipo de trabajo', 'text', ''],
+  ['titulo', 'Breve descripción', 'text', 'todo'],
+  ['descripcion', 'Detalles / descripción', 'area', 'todo'],
+  ['solicitante', 'Solicitante', 'text', ''],
   ['ubicacion', 'Ubicación', 'text', ''],
+  ['grupoServicios', 'Grupo de servicios', 'text', ''],
+  ['servicio', 'Servicio', 'text', ''],
   ['equipo', 'Equipo / activo', 'text', ''],
-  ['fechaLimite', 'Fecha límite', 'text', ''],
-  ['solicitante', 'Solicitante', 'text', '']
+  ['grupoTrabajo', 'Grupo de trabajo', 'text', ''],
+  ['responsable', 'Responsable', 'text', ''],
+  ['solicitud', 'Nº solicitud (SR)', 'text', ''],
+  ['estadoIcafm', 'Estado en ICAFM', 'text', ''],
+  ['inicioReal', 'Inicio real (ICAFM)', 'text', ''],
+  ['tiempoIcafm', 'Tiempo dedicado (ICAFM)', 'text', ''],
+  ['prioridad', 'Prioridad', 'text', ''],
+  ['fechaLimite', 'Fecha límite', 'text', '']
 ];
 function htmlCampos(valores, prefijo) {
   return '<div class="rejilla">' + CAMPOS_FORM.map(function (c) {
@@ -828,9 +1075,11 @@ function htmlCampos(valores, prefijo) {
       : '<input class="in" id="' + id + '" data-campo="' + c[0] + '" value="' + v + '"' +
         (c[0] === 'wo' ? ' inputmode="text" autocapitalize="characters"' : '') +
         (c[0] === 'prioridad' ? ' list="dl-prio"' : '') +
-        (c[0] === 'fechaLimite' ? ' placeholder="dd/mm/aaaa"' : '') + '>';
+        (c[0] === 'fechaLimite' || c[0] === 'inicioReal' ? ' placeholder="dd/mm/aaaa"' : '') +
+        (c[0] === 'tipoTrabajo' ? ' list="dl-tipo"' : '') + '>';
     return '<div class="' + c[3] + '"><label class="lbl" for="' + id + '">' + c[1] + '</label>' + input + '</div>';
-  }).join('') + '</div><datalist id="dl-prio"><option>Urgente</option><option>Alta</option><option>Media</option><option>Baja</option></datalist>';
+  }).join('') + '</div><datalist id="dl-prio"><option>Urgente</option><option>Alta</option><option>Media</option><option>Baja</option></datalist>' +
+    '<datalist id="dl-tipo"><option>CORRECTIVE</option><option>PREVENTIVE</option></datalist>';
 }
 
 function vistaNueva() {
@@ -942,6 +1191,10 @@ function pintarFicha() {
     (o.prioridad ? '<span>' + ico('bandera', 's') + esc(o.prioridad) + '</span>' : '') +
     (o.fechaLimite ? '<span>' + ico('calendario', 's') + 'Límite ' + esc(o.fechaLimite) + '</span>' : '') +
     (o.solicitante ? '<span>' + ico('persona', 's') + esc(o.solicitante) + '</span>' : '') +
+    (o.tipoTrabajo ? '<span>' + ico('bandera', 's') + esc(o.tipoTrabajo) + '</span>' : '') +
+    (o.servicio || o.grupoServicios ? '<span>' + ico('equipo', 's') + esc(o.grupoServicios || o.servicio) + '</span>' : '') +
+    (o.solicitud ? '<span>' + esc(o.solicitud) + '</span>' : '') +
+    (o.inicioReal ? '<span>' + ico('calendario', 's') + 'Inicio ' + esc(o.inicioReal) + '</span>' : '') +
     '</div>' +
     (o.titulo && o.descripcion ? '<p class="ayuda" style="margin:8px 0 0;white-space:pre-wrap">' + esc(o.descripcion) + '</p>' : '') +
     (pendiente ? '<div class="pend" style="margin-top:6px">Cambios sin enviar (se mandan solos al tener cobertura)</div>' : '') +
@@ -1383,89 +1636,27 @@ function ocrImagen(file) {
     }
     return Tesseract.createWorker(OCR_IDIOMAS, 1, opciones);
   }).then(function (worker) {
-    return worker.recognize(canvas).then(function (r) {
+    return worker.recognize(canvas, {}, { text: true, blocks: true, tsv: true }).then(function (r) {
       worker.terminate();
-      return r.data.text || '';
+      return { texto: r.data.text || '', palabras: palabrasOCR(r.data) };
     });
   });
 }
-
-/* Lectura de campos a partir del texto. Etiquetas en español e inglés (ICAFM / TRIRIGA / Maximo). */
-var ETIQUETAS = [
-  ['wo', ['n[ºo°]?\\.?\\s*(?:de\\s+)?(?:wo|orden(?:\\s+de\\s+trabajo)?|ot)', 'work\\s*order(?:\\s*(?:n[ºo°]|number|id|#))?', 'orden\\s+de\\s+trabajo', 'id\\s+(?:de\\s+(?:la\\s+)?)?(?:tarea|orden|wo)', 'task\\s*id', 'wo\\s*(?:n[ºo°]|#|id)?', 'ot']],
-  ['titulo', ['t[ií]tulo', 'resumen', 'asunto', 'nombre(?:\\s+de\\s+(?:la\\s+)?(?:tarea|orden))?', 'summary', 'short\\s+description', 'subject', 'task\\s+name', 'name']],
-  ['descripcion', ['descripci[oó]n(?:\\s+(?:del?\\s+)?(?:problema|trabajo|aver[ií]a|tarea))?', 'description', 'detalles?', 'problema', 'aver[ií]a', 'incidencia', 'comentarios?']],
-  ['ubicacion', ['ubicaci[oó]n(?:\\s+principal)?', 'localizaci[oó]n', 'location', 'primary\\s+location', 'emplazamiento', 'zona', 'espacio', 'space', 'planta', 'floor', '[aá]rea']],
-  ['equipo', ['equipo', 'activo', 'asset', 'm[aá]quina', 'elemento', 'instalaci[oó]n']],
-  ['prioridad', ['prioridad', 'priority', 'urgencia']],
-  ['fechaLimite', ['fecha\\s+l[ií]mite', 'fecha\\s+(?:objetivo|vencimiento|fin(?:\\s+planificad[ao])?|requerida)', 'vencimiento', 'fin\\s+planificad[ao]', 'planned\\s+end', 'target\\s+(?:date|finish|end)', 'due\\s+date', 'plazo']],
-  ['solicitante', ['solicitante', 'solicitado\\s+por', 'requested\\s+by', 'requested\\s+for', 'reported\\s+by', 'reportado\\s+por', 'contacto', 'requester']]
-];
-var RE_ETIQ = ETIQUETAS.map(function (e) {
-  return [e[0], new RegExp('^\\s*(?:' + e[1].join('|') + ')\\s*[:.#\\-–]?\\s*(.*)$', 'i')];
-});
-var RE_FECHA = /\b(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})\b/;
-function limpiarValor(k, v) {
-  v = String(v || '').replace(/\s+/g, ' ').replace(/^[:.\-–#\s]+/, '').trim();
-  if (k === 'wo') {
-    var m = v.match(/[A-Z]{0,4}-?\d{4,}/i);
-    return m ? m[0].toUpperCase() : '';
+/** Palabras con su posición en la foto (para respetar las columnas del impreso). */
+function palabrasOCR(d) {
+  var out = [];
+  var añadir = function (w) { if (w && w.text && w.bbox) out.push({ t: w.text, x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1 }); };
+  if (d.words && d.words.length) d.words.forEach(añadir);
+  else if (d.blocks && d.blocks.length) {
+    d.blocks.forEach(function (b) { (b.paragraphs || []).forEach(function (p) { (p.lines || []).forEach(function (l) { (l.words || []).forEach(añadir); }); }); });
   }
-  if (k === 'fechaLimite') {
-    var f = v.match(RE_FECHA);
-    if (!f) return '';
-    var y = f[3].length === 2 ? '20' + f[3] : f[3];
-    return dos(+f[1]) + '/' + dos(+f[2]) + '/' + y;
+  if (!out.length && d.tsv) {
+    d.tsv.split('\n').forEach(function (l) {
+      var c = l.split('\t');
+      if (c.length >= 12 && c[0] === '5' && c[11].trim()) out.push({ t: c[11], x0: +c[6], y0: +c[7], x1: +c[6] + +c[8], y1: +c[7] + +c[9] });
+    });
   }
-  if (k === 'prioridad') return v.split(/\s{2,}|\|/)[0].slice(0, 30);
-  return v.slice(0, k === 'descripcion' ? 1500 : 160);
-}
-function parsearOrden(texto) {
-  var lineas = String(texto || '').split(/\r?\n/).map(function (l) { return l.trim(); });
-  var campos = {};
-  for (var i = 0; i < lineas.length; i++) {
-    var l = lineas[i];
-    if (!l) continue;
-    for (var j = 0; j < RE_ETIQ.length; j++) {
-      var k = RE_ETIQ[j][0];
-      if (campos[k]) continue;
-      var m = l.match(RE_ETIQ[j][1]);
-      if (!m) continue;
-      var v = m[1];
-      // Valor en la(s) línea(s) siguiente(s) si la etiqueta va sola
-      if (!limpiarValor(k, v)) {
-        var sig = '';
-        for (var s = i + 1; s < lineas.length && s <= i + 2; s++) { if (lineas[s]) { sig = lineas[s]; break; } }
-        if (sig && !esEtiqueta(sig)) v = sig;
-      }
-      // Descripción: juntar líneas siguientes hasta la próxima etiqueta
-      if (k === 'descripcion') {
-        var extra = [];
-        for (var t = i + 1; t < lineas.length && extra.length < 8; t++) {
-          if (!lineas[t]) { if (extra.length) break; else continue; }
-          if (esEtiqueta(lineas[t])) break;
-          if (lineas[t] !== v) extra.push(lineas[t]);
-        }
-        v = [v].concat(extra).join(' ');
-      }
-      var lv = limpiarValor(k, v);
-      if (lv) { campos[k] = lv; break; }
-    }
-  }
-  // Recursos si no hay etiquetas
-  if (!campos.wo) {
-    var m1 = texto.match(/\b(?:WO|W\.O\.|OT)\s*[-:#nº°.]*\s*(\d{4,})/i) || texto.match(/\b(\d{7,10})\b/);
-    if (m1) campos.wo = m1[1];
-  }
-  if (!campos.prioridad) {
-    var p = texto.match(/\b(urgente|cr[ií]tica|alta|media|baja|P[1-5])\b/i);
-    if (p) campos.prioridad = cap(p[1].toLowerCase());
-  }
-  if (!campos.titulo && campos.descripcion) campos.titulo = campos.descripcion.slice(0, 80);
-  return campos;
-}
-function esEtiqueta(l) {
-  return RE_ETIQ.some(function (e) { var m = l.match(e[1]); return m && (m[1].length < l.length); });
+  return out;
 }
 
 /* --------------------------------------------------------- Modal / confirm */
