@@ -1,6 +1,6 @@
 // APP-WO: guarda la pantalla de la app para que abra aunque no haya cobertura.
 // Siempre intenta primero la versión nueva de internet; si no hay red, usa la guardada.
-var CACHE = 'appwo-v1.3';
+var CACHE = 'appwo-v1.3.1';
 var BASE = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png', './icon-180.png'];
 // Lector de fotos empaquetado: se guarda en el móvil una sola vez para que funcione sin internet
 var OCR = ['./ocr/tesseract.min.js', './ocr/worker.min.js', './ocr/tesseract-core-simd-lstm.wasm.js',
