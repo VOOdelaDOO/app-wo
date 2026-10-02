@@ -453,7 +453,7 @@ if (typeof module !== 'undefined') module.exports = { leerOrdenICAFM: leerOrdenI
  * Hoja de Google. Si no hay cobertura, las acciones esperan en cola.
  * ======================================================================== */
 
-var VERSION = '1.3.1';
+var VERSION = '1.4.0';
 // Servidor (Apps Script). Si la app se abre fuera de Google (GitHub Pages) habla con él por fetch.
 var API_URL = 'https://script.google.com/macros/s/AKfycbwgnPW14beEEiMFyUXsc-_E-fvKIoIYkGH67SHarAOm-2l8DGTWWUzGag6EuOP__9bK/exec';
 var LS_KEY = 'appwo.v1';
@@ -461,7 +461,7 @@ var OCR_IDIOMAS = 'spa';
 var TESSERACT_CDN = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
 /** Fuera de Google (GitHub Pages) el lector de fotos va EMPAQUETADO dentro de la app (carpeta ocr/). */
 function ocrLocal() { return !(window.google && google.script); }
-var SYNC_CADA_MS = 30000;
+var SYNC_CADA_MS = 45000;
 
 var NOMBRE_ESTADO = { pendiente: 'Pendiente', en_curso: 'En curso', pausada: 'Pausada',
   terminada: 'Terminada', cerrada: 'Cerrada', facturada: 'Facturada' };
